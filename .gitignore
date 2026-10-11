@@ -1,0 +1,16 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 本地凭证与运行状态
+.env
+.env.*
+.laichon_state*.json
+.laichon_state*.json.*
+.laichon_state*.lock
+
+# 日志和系统文件
+*.log
+.DS_Store
