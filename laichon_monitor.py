@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-name: 莱充低功率提醒
+name: 莱充低功率自动停止
 cron: */5 * * * *
 
 青龙任务命令：task laichon_monitor.py
@@ -129,8 +129,8 @@ def inspect_order(detail, record, threshold, now):
         return False, "采样时间异常或超过 15 分钟未更新", None
     if latest - start < 600:
         return False, "充电开始不足 10 分钟", latest
-    if record.get("notified"):
-        return False, f"功率 {power:g} W，本订单已提醒", latest
+    if record.get("stop_confirmed"):
+        return False, f"功率 {power:g} W，本订单已确认结束", latest
     if latest <= record.get("last_sample", -1) and record.get("threshold") == threshold:
         return False, "没有新的功率采样", latest
     if len(samples) < 2:
@@ -195,44 +195,140 @@ def save_state(path, state):
             os.unlink(name)
 
 
-def run(call, notify, state_path, threshold, now, account_name="我的车"):
-    state = load_state(state_path)
-    orders = active_orders(call, now)
-    print(f"[{account_name}] 找到 {len(orders)} 个充电中订单；提醒阈值 < {threshold:g} W")
-    errors = 0
-    api_error = None
-    for number in orders:
-        record = state.get(number, {})
+def queue_stop_notice(record, kind, title, content):
+    if record.get("stop_notice") != kind:
+        record["pending_notice"] = {"kind": kind, "title": title, "content": content}
+
+
+def money(value):
+    try:
+        amount = float(value)
+        return f"{amount / 100:.2f} 元" if math.isfinite(amount) and amount >= 0 else "待结算"
+    except (ValueError, TypeError):
+        return "待结算"
+
+
+def handle_stop(call, detail, record, state, state_path, threshold, now, account_name):
+    """先保存提交状态；已接受的停止请求只核对结果，不重复提交。"""
+    number = str(detail["order_no"])
+    if str(detail.get("order_status")) == "3" and not record.get("stop_accepted"):
+        # 上轮超时可能已执行：先查详情，再用当前采样重新判断是否仍需停止。
+        ready, _, _ = inspect_order(detail, {}, threshold, now)
+        if not ready:
+            record["stop_pending"] = False
+            save_state(state_path, state)
+            print(f"[{account_name}] 订单 {number}：当前采样不满足停止条件，继续监控")
+            return 0
+        record["stop_pending"] = True
+        save_state(state_path, state)
+        try:
+            call("stop", {"order_no": number})
+        except APIError as exc:
+            queue_stop_notice(record, "failed", f"{account_name}：莱充自动停止请求异常", "\n".join([
+                record["stop_context"], f"异常：{exc}",
+                "尚未确认充电已停止，请查看小程序。若登录失效，请更新此账号的 TOKEN 和 OPENID。",
+                "下一轮先核对订单；仍在充电且满足低功率条件时才重试停止。",
+            ]))
+            save_state(state_path, state)
+            return 1
+        record["stop_accepted"] = True
+        save_state(state_path, state)
         try:
             detail = call("detail", {"order_no": number})
             if str(detail.get("order_no")) != number:
+                raise APIError("停止后详情订单号与请求不一致")
+        except APIError as exc:
+            queue_stop_notice(record, "waiting", f"{account_name}：莱充停止结果待确认", "\n".join([
+                record["stop_context"], f"异常：{exc}",
+                "停止接口已返回成功，但暂时无法确认订单结束。下一轮继续查询，不重复提交停止请求。",
+            ]))
+            save_state(state_path, state)
+            return 1
+    if str(detail.get("order_status")) == "7":
+        record.update(stop_pending=False, stop_confirmed=True)
+        minutes = detail.get("used_time")
+        duration = f"{minutes} 分钟" if minutes is not None else "暂无数据"
+        queue_stop_notice(record, "completed", f"{account_name}：莱充充电已结束", "\n".join([
+            record["stop_context"],
+            "已查询确认订单为已完成（状态 7）。",
+            f"结束时间：{detail.get('finish_time') or '暂无数据'}",
+            f"停止原因：{detail.get('stop_type_desc') or '暂无数据'}",
+            f"充电时长：{duration}",
+            f"预付金额：{money(detail.get('pay_amount'))}",
+            f"当前结算金额：{money(detail.get('real_amount'))}",
+            f"当前退款金额：{money(detail.get('refund_amount'))} {detail.get('refund_status_desc') or ''}",
+        ]))
+        print(f"[{account_name}] 订单 {number}：已确认结束")
+        result = 0
+    else:
+        queue_stop_notice(record, "waiting", f"{account_name}：莱充停止结果待确认", "\n".join([
+            record["stop_context"],
+            f"当前订单状态：{detail.get('order_status')}，尚未确认已完成，请查看小程序。",
+            "下一轮继续核对。已返回成功的停止请求不会重复提交。",
+        ]))
+        print(f"[{account_name}] 订单 {number}：停止结果待确认")
+        result = 1
+    save_state(state_path, state)
+    return result
+
+
+def run(call, notify, state_path, threshold, now, account_name="我的车"):
+    state = load_state(state_path)
+    orders = active_orders(call, now)
+    print(f"[{account_name}] 找到 {len(orders)} 个充电中订单；自动停止阈值 < {threshold:g} W（连续两条采样）")
+    # 已结束的订单可能从充电列表消失，仍需确认停止结果或补发通知。
+    numbers = dict.fromkeys(orders)
+    numbers.update({number: None for number, record in state.items() if record.get("stop_pending")})
+    errors = 0
+    api_error = None
+    for number in numbers:
+        record = state.get(number, {})
+        try:
+            if record.get("stop_confirmed"):
+                continue
+            detail = call("detail", {"order_no": number})
+            if str(detail.get("order_no")) != number:
                 raise ValueError("详情订单号与请求不一致")
+            if record.get("stop_pending"):
+                errors += handle_stop(call, detail, record, state, state_path, threshold, now, account_name)
+                continue
             ready, message, timestamp = inspect_order(detail, record, threshold, now)
             print(f"[{account_name}] 订单 {number}：{message}")
             if ready:
-                content = "\n".join([
+                record["stop_context"] = "\n".join([
                     f"车辆：{account_name}",
                     f"订单：{number}",
                     f"地点：{detail.get('site_name', '')} {detail.get('device_name', '')}",
                     f"设备：{detail.get('device_no', '')}，插口：{detail.get('gun_no', '')}",
                     message,
                     f"采样时间：{datetime.fromtimestamp(timestamp, CHINA):%Y-%m-%d %H:%M:%S}",
-                    f"功率连续两条采样低于 {threshold:g} W，已进入低功率阶段，请查看充电情况。",
-                    "低功率不代表已充满或已断电。",
+                    f"功率连续两条采样低于 {threshold:g} W，触发自动停止。",
                 ])
-                notify(f"{account_name}：莱充低功率提醒", content)
-                record["notified"] = True
-                print("ShowDoc 已接受推送请求")
+                state[number] = record
+                errors += handle_stop(call, detail, record, state, state_path, threshold, now, account_name)
+                continue
             if timestamp is not None:
                 record.update(last_sample=timestamp, threshold=threshold, seen_at=now)
                 state[number] = record
                 save_state(state_path, state)
         except (RuntimeError, ValueError, KeyError, TypeError, OSError) as exc:
-            # 通知失败时不提交本次采样，下一轮仍可重试。
             errors += 1
             if isinstance(exc, APIError):
                 api_error = exc
             print(f"[{account_name}] 订单 {number}：处理失败（{type(exc).__name__}），详情：{exc}")
+    for number, record in state.items():
+        notice = record.get("pending_notice")
+        if not notice:
+            continue
+        try:
+            notify(notice["title"], notice["content"])
+            record["stop_notice"] = notice["kind"]
+            del record["pending_notice"]
+            save_state(state_path, state)
+            print(f"[{account_name}] 订单 {number}：ShowDoc 已接受推送请求")
+        except (RuntimeError, ValueError, KeyError, TypeError, OSError):
+            errors += 1
+            print(f"[{account_name}] 订单 {number}：结果通知未完成，下一轮重试")
     if api_error is not None:
         raise api_error
     return 1 if errors else 0
@@ -246,7 +342,7 @@ def report_api_error(state_path, account_name, error):
     content = "\n".join([
         f"车辆：{account_name}",
         f"异常：{error}",
-        "暂时无法查询充电状态，低功率监控无法正常进行。",
+        "暂时无法查询充电状态，无法正常监控或确认自动停止结果。",
         "若登录已失效，请重新抓包更新此账号的 TOKEN 和 OPENID；连接失败时请检查网络。",
         "本次异常只提醒一次，查询恢复后会自动重新启用异常提醒。",
     ])
@@ -265,7 +361,7 @@ def clear_api_error(state_path):
 
 def main():
     if sys.argv[1:] == ["--test-notify"]:
-        send_notification("莱充提醒测试", "ShowDoc 推送配置测试。正式监控将在连续两条功率低于 20 W 时提醒。")
+        send_notification("莱充提醒测试", "ShowDoc 推送配置测试。正式任务默认在连续两条有效采样低于 30 W 时自动停止充电并通知。")
         print("ShowDoc 已接受测试推送，请查看微信")
         return 0
     if sys.argv[1:]:
@@ -273,7 +369,7 @@ def main():
     accounts = configured_accounts()
     if not os.getenv("SHOWDOC_PUSH_URL", "").strip():
         raise RuntimeError("请在青龙环境变量中配置 SHOWDOC_PUSH_URL")
-    threshold = float(os.getenv("LAICHON_POWER_THRESHOLD", "20"))
+    threshold = float(os.getenv("LAICHON_POWER_THRESHOLD", "30"))
     if not math.isfinite(threshold) or threshold <= 0:
         raise ValueError("LAICHON_POWER_THRESHOLD 必须是大于 0 的有限数值")
     state_path = Path(os.getenv("LAICHON_STATE_FILE", str(Path(__file__).with_name(".laichon_state.json"))))
